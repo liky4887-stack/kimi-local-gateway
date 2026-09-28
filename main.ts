@@ -2,6 +2,7 @@ const PORT = Number(Deno.env.get("PORT") ?? "8088");
 const LOCAL_KEY = Deno.env.get("LOCAL_KEY") ?? "sk-local-kimi";
 const CREDS = Deno.env.get("KIMI_CREDS") ?? `${Deno.env.get("HOME")}/cookies/kimi-creds.json`;
 const UPSTREAM = "https://www.kimi.ai/apiv2/kimi.gateway.chat.v1.ChatService/Chat";
+const SEED = `${Deno.env.get("HOME")}/cookies/kimi-tokens.json`;
 
 type Creds = { bearerToken: string; cookies: string; extraHeaders?: Record<string,string>; deviceId?: string; sessionId?: string; trafficId?: string };
 
@@ -23,9 +24,77 @@ function decodeJwtExp(token: string): number | null {
   }
 }
 
+// Copy tokens from kimi-tokens.json into kimi-creds.json whenever
+// the seed file has a newer, valid pair. Called on every request and
+// again after a failed refresh. Idempotent — no-ops if already in sync.
+function decodeJwtIat(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const j = JSON.parse(new TextDecoder().decode(
+      Uint8Array.from(atob(pad), c => c.charCodeAt(0))
+    ));
+    return typeof j.iat === "number" ? j.iat : null;
+  } catch {
+    return null;
+  }
+}
+
+// Copy tokens from kimi-tokens.json into kimi-creds.json ONLY when the
+// seed file is strictly newer than what's already in creds.
+//
+// Rationale: the gateway refreshes its own access token every ~15 min
+// and writes the new pair to kimi-creds.json. The seed file is only
+// updated when the user pastes a fresh pair by hand. If we blindly
+// overwrote creds with seed on every request, we'd roll back good
+// refreshed tokens to a stale paste and break the next call.
+function syncFromSeed(): boolean {
+  try {
+    const seed = JSON.parse(Deno.readTextFileSync(SEED));
+    const seedAccess = typeof seed.access_token === "string" ? seed.access_token.trim() : "";
+    const seedRefresh = typeof seed.refresh_token === "string" ? seed.refresh_token.trim() : "";
+    if (!seedAccess.startsWith("eyJ") || !seedRefresh.startsWith("eyJ")) return false;
+
+    const creds = JSON.parse(Deno.readTextFileSync(CREDS));
+
+    // Already identical — nothing to do.
+    if (creds.bearerToken === seedAccess && creds.refreshToken === seedRefresh) {
+      return false;
+    }
+
+    // Only use the seed if its access token was minted AFTER the creds
+    // one. Otherwise creds is fresher (via auto-refresh) and we must not
+    // overwrite it.
+    const seedIat = decodeJwtIat(seedAccess);
+    const credsIat = creds.bearerToken ? decodeJwtIat(creds.bearerToken) : null;
+    if (seedIat !== null && credsIat !== null && seedIat <= credsIat) {
+      return false;
+    }
+
+    creds.bearerToken = seedAccess;
+    creds.refreshToken = seedRefresh;
+    creds.acquiredAt = Date.now();
+    Deno.writeTextFileSync(CREDS, JSON.stringify(creds, null, 2));
+    console.log("seed.sync", {
+      seedIat,
+      credsIat,
+      accessExp: decodeJwtExp(seedAccess),
+      refreshExp: decodeJwtExp(seedRefresh),
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const REFRESH_URL = "https://auth.kimi.ai/api/account.gateway.v1.AuthService/RefreshToken";
 
 async function ensureFreshToken(): Promise<Creds> {
+  // 1. Pick up any token pair the user dropped into kimi-tokens.json
+  // since the last request. Idempotent.
+  syncFromSeed();
+
   const fresh = loadCreds();
   const now = Math.floor(Date.now() / 1000);
   const exp = fresh.bearerToken ? decodeJwtExp(fresh.bearerToken) : null;
@@ -40,11 +109,13 @@ async function ensureFreshToken(): Promise<Creds> {
   if (!rt) {
     throw new Error(
       "kimi access token expired and no refreshToken in creds file. " +
-      "Get a fresh token pair from www.kimi.ai and retry.",
+      "Drop a fresh pair into ~/cookies/kimi-tokens.json and retry — no restart needed.",
     );
   }
 
-  console.log("refreshing token, seconds left:", remaining);
+  const refreshExp = decodeJwtExp(rt);
+  const refreshDays = refreshExp ? Math.floor((refreshExp - now) / 86400) : null;
+  console.log("refreshing token, access left:", remaining, "s | refresh expires in:", refreshDays, "days");
   const r = await fetch(REFRESH_URL, {
     method: "POST",
     headers: {
@@ -74,9 +145,19 @@ async function ensureFreshToken(): Promise<Creds> {
     (j && j.data && (j.data.access_token || j.data.accessToken));
 
   if (!newToken || typeof newToken !== "string") {
+    // Refresh failed. Before throwing, check if the user just dropped
+    // a fresh pair into kimi-tokens.json. If yes, use it.
+    if (syncFromSeed()) {
+      const recovered = loadCreds();
+      if (recovered.bearerToken !== fresh.bearerToken) {
+        console.log("refresh failed but seed recovered — using seed tokens");
+        return recovered;
+      }
+    }
     throw new Error(
       "kimi token refresh failed (HTTP " + r.status + "): " + text.slice(0, 200) +
-      ". If this repeats, the refresh token is dead — get a fresh pair from the browser.",
+      ". The refresh token is likely dead. Drop a fresh access+refresh pair into " +
+      "~/cookies/kimi-tokens.json and retry — no restart needed.",
     );
   }
 
@@ -275,5 +356,28 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, async (req) => {
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   }), { headers: { "content-type": "application/json" } });
 });
+
+function fmtExp(exp: number | null): string {
+  if (exp === null) return "?";
+  const now = Math.floor(Date.now() / 1000);
+  const secs = exp - now;
+  if (secs <= 0) return "EXPIRED";
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  return d + "d " + h + "h";
+}
+
+try {
+  const c = loadCreds() as any;
+  const now = Math.floor(Date.now() / 1000);
+  const aExp = c.bearerToken ? decodeJwtExp(c.bearerToken) : null;
+  const rExp = c.refreshToken ? decodeJwtExp(c.refreshToken) : null;
+  console.log(`token status: access ${fmtExp(aExp)} | refresh ${fmtExp(rExp)}`);
+  if (rExp && rExp - now < 7 * 86400) {
+    console.warn("refresh token expires in <7 days — grab a fresh pair from www.kimi.ai");
+  }
+} catch (e) {
+  console.warn("could not read creds at startup:", e);
+}
 
 console.log(`✅ gateway :${PORT} → ${UPSTREAM}`);
