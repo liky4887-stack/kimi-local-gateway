@@ -90,32 +90,21 @@ function syncFromSeed(): boolean {
 
 const REFRESH_URL = "https://auth.kimi.ai/api/account.gateway.v1.AuthService/RefreshToken";
 
-async function ensureFreshToken(): Promise<Creds> {
-  // 1. Pick up any token pair the user dropped into kimi-tokens.json
-  // since the last request. Idempotent.
-  syncFromSeed();
+// ─── Token cache + refresh queue (kimi-free-api model) ─────────────
+// Access tokens live 300s. Cache them keyed by the refresh token that
+// produced them, and coalesce concurrent refreshes so two parallel
+// requests never spend the same one-shot refresh token twice.
+const tokenCache = new Map<string, { access: string; expiresAt: number }>();
+const inflight = new Map<string, Promise<string>>();
 
-  const fresh = loadCreds();
-  const now = Math.floor(Date.now() / 1000);
-  const exp = fresh.bearerToken ? decodeJwtExp(fresh.bearerToken) : null;
-  const remaining = exp ? exp - now : null;
+function pickRefreshToken(raw: string): string {
+  // Multi-account support: comma-separated refresh tokens rotate.
+  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  if (list.length <= 1) return list[0] ?? "";
+  return list[Math.floor(Math.random() * list.length)];
+}
 
-  // Still fresh — nothing to do.
-  if (remaining !== null && remaining > 120) {
-    return fresh;
-  }
-
-  const rt = (fresh as any).refreshToken;
-  if (!rt) {
-    throw new Error(
-      "kimi access token expired and no refreshToken in creds file. " +
-      "Drop a fresh pair into ~/cookies/kimi-tokens.json and retry — no restart needed.",
-    );
-  }
-
-  const refreshExp = decodeJwtExp(rt);
-  const refreshDays = refreshExp ? Math.floor((refreshExp - now) / 86400) : null;
-  console.log("refreshing token, access left:", remaining, "s | refresh expires in:", refreshDays, "days");
+async function refreshOnce(refreshToken: string, cookies: string, deviceId?: string, sessionId?: string, extraHeaders?: Record<string, string>): Promise<{ access: string; refresh: string }> {
   const r = await fetch(REFRESH_URL, {
     method: "POST",
     headers: {
@@ -124,46 +113,117 @@ async function ensureFreshToken(): Promise<Creds> {
       "origin": "https://www.kimi.ai",
       "referer": "https://www.kimi.ai/",
       "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-      "authorization": `Bearer ${fresh.bearerToken}`,
-      "cookie": fresh.cookies ?? "",
+      "authorization": `Bearer ${refreshToken}`,
+      "cookie": cookies ?? "",
       "connect-protocol-version": "1",
       "x-msh-platform": "web",
       "x-msh-version": "2.3.0",
-      ...(fresh.deviceId ? { "x-msh-device-id": fresh.deviceId } : {}),
-      ...(fresh.sessionId ? { "x-msh-session-id": fresh.sessionId } : {}),
-      ...(fresh.extraHeaders ?? {}),
+      ...(deviceId ? { "x-msh-device-id": deviceId } : {}),
+      ...(sessionId ? { "x-msh-session-id": sessionId } : {}),
+      ...(extraHeaders ?? {}),
     },
-    body: JSON.stringify({ refresh_token: rt }),
+    body: JSON.stringify({ refresh_token: refreshToken }),
   });
   const text = await r.text();
-  console.log("refresh status:", r.status);
-
   let j: any = null;
   try { j = JSON.parse(text); } catch {}
-  const newToken =
+  const newAccess =
     (j && (j.access_token || j.accessToken)) ||
     (j && j.data && (j.data.access_token || j.data.accessToken));
+  const newRefresh =
+    (j && (j.refresh_token || j.refreshToken)) ||
+    (j && j.data && (j.data.refresh_token || j.data.refreshToken)) ||
+    refreshToken;
+  if (!newAccess || typeof newAccess !== "string") {
+    throw new Error("refresh HTTP " + r.status + ": " + text.slice(0, 200));
+  }
+  return { access: newAccess, refresh: newRefresh };
+}
 
-  if (!newToken || typeof newToken !== "string") {
-    // Refresh failed. Before throwing, check if the user just dropped
-    // a fresh pair into kimi-tokens.json. If yes, use it.
-    if (syncFromSeed()) {
-      const recovered = loadCreds();
-      if (recovered.bearerToken !== fresh.bearerToken) {
-        console.log("refresh failed but seed recovered — using seed tokens");
-        return recovered;
-      }
-    }
-    throw new Error(
-      "kimi token refresh failed (HTTP " + r.status + "): " + text.slice(0, 200) +
-      ". The refresh token is likely dead. Drop a fresh access+refresh pair into " +
-      "~/cookies/kimi-tokens.json and retry — no restart needed.",
-    );
+async function acquireAccessToken(creds: any): Promise<string> {
+  const raw = String(creds.refreshToken || "");
+  if (!raw) throw new Error("no refreshToken in creds file");
+  const refreshToken = pickRefreshToken(raw);
+
+  const now = Math.floor(Date.now() / 1000);
+
+  // 1. Cache hit — still has >60s of life.
+  const cached = tokenCache.get(refreshToken);
+  if (cached && cached.expiresAt - now > 60) {
+    return cached.access;
   }
 
-  fresh.bearerToken = newToken;
-  Deno.writeTextFileSync(CREDS, JSON.stringify(fresh, null, 2));
-  console.log("token refreshed, new exp:", decodeJwtExp(newToken));
+  // 2. Queue — someone else is already refreshing this exact token.
+  const existing = inflight.get(refreshToken);
+  if (existing) return existing;
+
+  // 3. Fire one refresh, share the promise with every concurrent caller.
+  const promise = (async () => {
+    try {
+      const { access, refresh } = await refreshOnce(
+        refreshToken,
+        creds.cookies,
+        creds.deviceId,
+        creds.sessionId,
+        creds.extraHeaders,
+      );
+
+      const exp = decodeJwtExp(access) ?? (now + 300);
+      tokenCache.set(refreshToken, { access, expiresAt: exp });
+
+      // Persist BOTH tokens to disk so the next request's freshness check
+      // short-circuits and no refresh fires at all. Without this, every
+      // request re-reads the stale bearerToken and refreshes again.
+      const store = JSON.parse(Deno.readTextFileSync(CREDS));
+      store.bearerToken = access;
+      if (refresh !== refreshToken) {
+        if (typeof store.refreshToken === "string" && store.refreshToken.includes(",")) {
+          store.refreshToken = store.refreshToken
+            .split(",")
+            .map((s: string) => s.trim() === refreshToken ? refresh : s.trim())
+            .join(",");
+        } else {
+          store.refreshToken = refresh;
+        }
+        console.log("refresh.rotated", { newExp: decodeJwtExp(refresh) });
+      }
+      store.acquiredAt = Date.now();
+      Deno.writeTextFileSync(CREDS, JSON.stringify(store, null, 2));
+
+      console.log("token.acquired", { exp, ttl: exp - now });
+      return access;
+    } catch (e) {
+      // Remove from cache so the next call re-tries cleanly.
+      tokenCache.delete(refreshToken);
+      throw e;
+    } finally {
+      inflight.delete(refreshToken);
+    }
+  })();
+
+  inflight.set(refreshToken, promise);
+  return promise;
+}
+
+async function ensureFreshToken(): Promise<Creds> {
+  // 1. Pick up any token pair the user dropped into kimi-tokens.json
+  //    since the last request. Idempotent.
+  syncFromSeed();
+
+  const fresh = loadCreds() as any;
+  const now = Math.floor(Date.now() / 1000);
+  const exp = fresh.bearerToken ? decodeJwtExp(fresh.bearerToken) : null;
+
+  // 2. Still fresh — nothing to do.
+  if (exp !== null && exp - now > 120) {
+    return fresh;
+  }
+
+  // 3. Refresh via the cache + queue. If the whole thing fails with a
+  //    dead refresh token, acquireAccessToken throws and the caller
+  //    surfaces a 503 telling the user to refresh the seed.
+  console.log("ensureFreshToken: acquiring, access left:", exp ? exp - now : null);
+  fresh.bearerToken = await acquireAccessToken(fresh);
   return fresh;
 }
 
@@ -247,6 +307,27 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, async (req) => {
         JSON.stringify({ ok: false, error: e instanceof Error ? e.message : String(e) }),
         { status: 500, headers: { "content-type": "application/json", "access-control-allow-origin": "*" } },
       );
+    }
+  }
+
+  // Validate a refresh token without touching the cache.
+  if (url.pathname === "/token/check" && req.method === "POST") {
+    try {
+      const { token } = await req.json();
+      if (typeof token !== "string" || !token.startsWith("eyJ")) {
+        return new Response(JSON.stringify({ live: false, error: "not a JWT" }), {
+          status: 400, headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+        });
+      }
+      const creds = loadCreds() as any;
+      const { access } = await refreshOnce(token, creds.cookies, creds.deviceId, creds.sessionId, creds.extraHeaders);
+      return new Response(JSON.stringify({ live: true, accessExp: decodeJwtExp(access) }), {
+        headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ live: false, error: e instanceof Error ? e.message : String(e) }), {
+        status: 200, headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+      });
     }
   }
 
