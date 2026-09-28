@@ -31,14 +31,17 @@ async function ensureFreshToken(): Promise<Creds> {
   const exp = fresh.bearerToken ? decodeJwtExp(fresh.bearerToken) : null;
   const remaining = exp ? exp - now : null;
 
+  // Still fresh — nothing to do.
   if (remaining !== null && remaining > 120) {
     return fresh;
   }
 
   const rt = (fresh as any).refreshToken;
   if (!rt) {
-    console.warn("token expired and no refreshToken in creds file");
-    return fresh;
+    throw new Error(
+      "kimi access token expired and no refreshToken in creds file. " +
+      "Get a fresh token pair from www.kimi.ai and retry.",
+    );
   }
 
   console.log("refreshing token, seconds left:", remaining);
@@ -71,8 +74,10 @@ async function ensureFreshToken(): Promise<Creds> {
     (j && j.data && (j.data.access_token || j.data.accessToken));
 
   if (!newToken || typeof newToken !== "string") {
-    console.error("refresh failed, body head:", text.slice(0, 300));
-    return fresh;
+    throw new Error(
+      "kimi token refresh failed (HTTP " + r.status + "): " + text.slice(0, 200) +
+      ". If this repeats, the refresh token is dead — get a fresh pair from the browser.",
+    );
   }
 
   fresh.bearerToken = newToken;
@@ -82,10 +87,11 @@ async function ensureFreshToken(): Promise<Creds> {
 }
 
 // Connect-RPC frame: 1 byte flags + 4 byte BE length + JSON
-function frame(obj: unknown): Uint8Array {
+function frame(obj: unknown): Uint8Array<ArrayBuffer> {
   const json = new TextEncoder().encode(JSON.stringify(obj));
-  const out = new Uint8Array(5 + json.length);
-  new DataView(out.buffer).setUint32(1, json.length, false);
+  const buf = new ArrayBuffer(5 + json.length);
+  const out = new Uint8Array(buf);
+  new DataView(buf).setUint32(1, json.length, false);
   out.set(json, 5);
   return out;
 }
@@ -171,7 +177,17 @@ Deno.serve({ port: PORT, hostname: "0.0.0.0" }, async (req) => {
   }
 
   const body = await req.json();
-  const creds = await ensureFreshToken();
+
+  let creds: Creds;
+  try {
+    creds = await ensureFreshToken();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return new Response(
+      JSON.stringify({ error: { message: "kimi auth failed", detail: msg } }),
+      { status: 503, headers: { "content-type": "application/json" } },
+    );
+  }
   const lastUser = [...(body.messages ?? [])].reverse().find((m: any) => m.role !== "assistant");
   const prompt = String(lastUser?.content ?? "");
 
