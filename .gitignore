@@ -1,0 +1,4 @@
+.env
+kimi.log
+*.json
+*.log
